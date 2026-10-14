@@ -48,9 +48,15 @@ func TestProxy_ModelScopedQuotaIsolation_ClaudeExhaustsAndRotates_GeminiStaysOnI
 		Status:      domain.AccountStatusActive,
 		UpdatedAt:   time.Now().UTC().Add(-5 * time.Minute),
 	}
-	_ = accRepo.Create(ctx, accA)
-	_ = accRepo.Create(ctx, accB)
-	_ = accRepo.SetActive(ctx, "acc-A")
+	if err := accRepo.Create(ctx, accA); err != nil {
+		t.Fatalf("Create accA: %v", err)
+	}
+	if err := accRepo.Create(ctx, accB); err != nil {
+		t.Fatalf("Create accB: %v", err)
+	}
+	if err := accRepo.SetActive(ctx, "acc-A"); err != nil {
+		t.Fatalf("SetActive acc-A: %v", err)
+	}
 
 	failoverEngine := proxy.NewFailoverEngine(
 		accRepo,
@@ -165,6 +171,15 @@ func TestProxy_ModelScopedQuotaIsolation_ClaudeExhaustsAndRotates_GeminiStaysOnI
 	if receivedTokens[0] != "Bearer token-alice" {
 		t.Errorf("CRITICAL BUG: Gemini request used wrong token! Expected 'Bearer token-alice', got %s", receivedTokens[0])
 	}
+
+	// Verify Alice's active pointer for Gemini is completely unaffected by Claude exhaustion
+	geminiActiveAfter, err := accRepo.GetActiveForCategory(ctx, domain.CategoryGemini)
+	if err != nil {
+		t.Fatalf("GetActiveForCategory(Gemini): %v", err)
+	}
+	if geminiActiveAfter.ID != "acc-A" {
+		t.Fatalf("expected Gemini active pointer to remain acc-A, got %s", geminiActiveAfter.ID)
+	}
 }
 
 func TestProxy_ModelScopedQuotaIsolation_ConcurrentSessions_NoCrossInterference(t *testing.T) {
@@ -197,9 +212,15 @@ func TestProxy_ModelScopedQuotaIsolation_ConcurrentSessions_NoCrossInterference(
 		Status:      domain.AccountStatusActive,
 		UpdatedAt:   time.Now().UTC().Add(-5 * time.Minute),
 	}
-	_ = accRepo.Create(ctx, accA)
-	_ = accRepo.Create(ctx, accB)
-	_ = accRepo.SetActive(ctx, "acc-A")
+	if err := accRepo.Create(ctx, accA); err != nil {
+		t.Fatalf("Create accA: %v", err)
+	}
+	if err := accRepo.Create(ctx, accB); err != nil {
+		t.Fatalf("Create accB: %v", err)
+	}
+	if err := accRepo.SetActive(ctx, "acc-A"); err != nil {
+		t.Fatalf("SetActive acc-A: %v", err)
+	}
 
 	failoverEngine := proxy.NewFailoverEngine(
 		accRepo,
@@ -287,13 +308,152 @@ func TestProxy_ModelScopedQuotaIsolation_ConcurrentSessions_NoCrossInterference(
 	}
 
 	// Verify pointers after concurrent sessions
-	claudeActive, _ := accRepo.GetActiveForCategory(ctx, domain.CategoryClaudeGPT)
-	geminiActive, _ := accRepo.GetActiveForCategory(ctx, domain.CategoryGemini)
+	claudeActive, err := accRepo.GetActiveForCategory(ctx, domain.CategoryClaudeGPT)
+	if err != nil {
+		t.Fatalf("GetActiveForCategory Claude: %v", err)
+	}
+	geminiActive, err := accRepo.GetActiveForCategory(ctx, domain.CategoryGemini)
+	if err != nil {
+		t.Fatalf("GetActiveForCategory Gemini: %v", err)
+	}
 
 	if claudeActive.ID != "acc-B" {
 		t.Errorf("expected Claude active on acc-B, got %s", claudeActive.ID)
 	}
 	if geminiActive.ID != "acc-A" {
 		t.Errorf("expected Gemini active on acc-A, got %s", geminiActive.ID)
+	}
+}
+
+func TestProxy_ModelScopedQuotaIsolation_FallbackEnabled_ClaudeDoesNotFallbackToGeminiFlash(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "proxy_fallback_iso_test.db")
+	db, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	accRepo := sqlite.NewAccountRepository(db)
+	quotaRepo := sqlite.NewQuotaRepository(db)
+	broadcaster := proxy.NewBroadcaster(100)
+
+	accA := &domain.Account{
+		ID:          "acc-A",
+		Email:       "alice@example.com",
+		AccessToken: "token-alice",
+		IsActive:    true,
+		Status:      domain.AccountStatusActive,
+		UpdatedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+	accB := &domain.Account{
+		ID:          "acc-B",
+		Email:       "bob@example.com",
+		AccessToken: "token-bob",
+		IsActive:    false,
+		Status:      domain.AccountStatusActive,
+		UpdatedAt:   time.Now().UTC().Add(-5 * time.Minute),
+	}
+	if err := accRepo.Create(ctx, accA); err != nil {
+		t.Fatalf("Create accA: %v", err)
+	}
+	if err := accRepo.Create(ctx, accB); err != nil {
+		t.Fatalf("Create accB: %v", err)
+	}
+	if err := accRepo.SetActive(ctx, "acc-A"); err != nil {
+		t.Fatalf("SetActive acc-A: %v", err)
+	}
+
+	// Enable model fallback: primary = gemini-2.5-pro, secondary = gemini-2.5-flash
+	failoverEngine := proxy.NewFailoverEngine(
+		accRepo,
+		broadcaster,
+		nil,
+		proxy.WithQuotaRepository(quotaRepo),
+		proxy.WithModelFallback("gemini-2.5-pro", "gemini-2.5-flash", true),
+	)
+
+	var reqTokensMu sync.Mutex
+	var receivedRequests []string
+
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqTokensMu.Lock()
+		auth := r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		model, _, _ := proxy.ExtractModelFromRequest(r, body)
+		receivedRequests = append(receivedRequests, fmt.Sprintf("%s:%s", auth, model))
+		reqTokensMu.Unlock()
+
+		if model == "claude-3-7-sonnet" {
+			if auth == "Bearer token-alice" {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"response":"claude ok on bob"}`))
+			return
+		}
+
+		if model == "gemini-2.5-flash" {
+			t.Errorf("FATAL BUG: Claude request was rewritten to gemini-2.5-flash!")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"response":"flash fallback"}`))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockUpstream.Close()
+
+	handler, err := proxy.NewProxyHandler(
+		accRepo,
+		proxy.WithTargetURL(mockUpstream.URL),
+		proxy.WithFailoverEngine(failoverEngine),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler: %v", err)
+	}
+
+	// Send Claude request that 429s on Alice
+	claudeReqBody := []byte(`{"model":"claude-3-7-sonnet","prompt":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1internal:generateContent", bytes.NewReader(claudeReqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200 OK after rotation to Bob, got %d: %s", w.Code, w.Body.String())
+	}
+
+	reqTokensMu.Lock()
+	defer reqTokensMu.Unlock()
+	if len(receivedRequests) != 2 {
+		t.Fatalf("expected 2 requests (Alice fail + Bob success), got %d: %v", len(receivedRequests), receivedRequests)
+	}
+	if receivedRequests[0] != "Bearer token-alice:claude-3-7-sonnet" {
+		t.Errorf("expected first attempt on Alice for claude-3-7-sonnet, got %s", receivedRequests[0])
+	}
+	if receivedRequests[1] != "Bearer token-bob:claude-3-7-sonnet" {
+		t.Errorf("expected second attempt on Bob for claude-3-7-sonnet, got %s", receivedRequests[1])
+	}
+
+	// Verify Claude pointer rotated to Bob, Gemini remains on Alice
+	claudeActive, err := accRepo.GetActiveForCategory(ctx, domain.CategoryClaudeGPT)
+	if err != nil {
+		t.Fatalf("GetActiveForCategory Claude: %v", err)
+	}
+	if claudeActive.ID != "acc-B" {
+		t.Errorf("expected Claude active acc-B, got %s", claudeActive.ID)
+	}
+
+	geminiActive, err := accRepo.GetActiveForCategory(ctx, domain.CategoryGemini)
+	if err != nil {
+		t.Fatalf("GetActiveForCategory Gemini: %v", err)
+	}
+	if geminiActive.ID != "acc-A" {
+		t.Errorf("expected Gemini active acc-A, got %s", geminiActive.ID)
 	}
 }

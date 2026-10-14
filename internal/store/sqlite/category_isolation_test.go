@@ -117,12 +117,18 @@ func TestCategoryIsolation_GetNextAvailableForCategory_WithExhaustedBuckets(t *t
 	accB := &domain.Account{ID: "acc-B", Email: "b@example.com", Status: domain.AccountStatusActive, UpdatedAt: now.Add(-20 * time.Minute)}
 	accC := &domain.Account{ID: "acc-C", Email: "c@example.com", Status: domain.AccountStatusActive, UpdatedAt: now.Add(-10 * time.Minute)}
 
-	_ = accRepo.Create(ctx, accA)
-	_ = accRepo.Create(ctx, accB)
-	_ = accRepo.Create(ctx, accC)
+	if err := accRepo.Create(ctx, accA); err != nil {
+		t.Fatalf("Create accA: %v", err)
+	}
+	if err := accRepo.Create(ctx, accB); err != nil {
+		t.Fatalf("Create accB: %v", err)
+	}
+	if err := accRepo.Create(ctx, accC); err != nil {
+		t.Fatalf("Create accC: %v", err)
+	}
 
 	// Bucket: accA exhausted on Claude
-	_ = quotaRepo.UpsertBuckets(ctx, []*domain.QuotaBucket{
+	if err := quotaRepo.UpsertBuckets(ctx, []*domain.QuotaBucket{
 		{
 			AccountID:         "acc-A",
 			BucketID:          "claude-3-5-sonnet",
@@ -131,10 +137,12 @@ func TestCategoryIsolation_GetNextAvailableForCategory_WithExhaustedBuckets(t *t
 			RemainingFraction: 0.0,
 			ResetTime:         now.Add(2 * time.Hour),
 		},
-	})
+	}); err != nil {
+		t.Fatalf("UpsertBuckets accA: %v", err)
+	}
 
 	// Bucket: accC exhausted on Gemini
-	_ = quotaRepo.UpsertBuckets(ctx, []*domain.QuotaBucket{
+	if err := quotaRepo.UpsertBuckets(ctx, []*domain.QuotaBucket{
 		{
 			AccountID:         "acc-C",
 			BucketID:          "gemini-2.5-pro",
@@ -143,7 +151,9 @@ func TestCategoryIsolation_GetNextAvailableForCategory_WithExhaustedBuckets(t *t
 			RemainingFraction: 0.0,
 			ResetTime:         now.Add(2 * time.Hour),
 		},
-	})
+	}); err != nil {
+		t.Fatalf("UpsertBuckets accC: %v", err)
+	}
 
 	// For Claude: accA is exhausted, next should be accB
 	nextClaude, err := accRepo.GetNextAvailableForCategory(ctx, domain.CategoryClaudeGPT, "")

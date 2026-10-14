@@ -43,13 +43,19 @@ func (r *AccountRepository) Create(ctx context.Context, acc *domain.Account) err
 		expiryStr = "1970-01-01T00:00:00Z"
 	}
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	query := `
 		INSERT INTO accounts (
 			id, email, refresh_token, access_token, token_expiry,
 			is_active, status, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
-	_, err := r.db.ExecContext(ctx, query,
+	_, err = tx.ExecContext(ctx, query,
 		acc.ID,
 		acc.Email,
 		acc.RefreshToken,
@@ -68,13 +74,15 @@ func (r *AccountRepository) Create(ctx context.Context, acc *domain.Account) err
 	}
 
 	if acc.IsActive {
-		_, _ = r.db.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO active_category_accounts (category, account_id) VALUES ('claude_gpt', ?), ('gemini', ?)
 			ON CONFLICT(category) DO UPDATE SET account_id = excluded.account_id
-		`, acc.ID, acc.ID)
+		`, acc.ID, acc.ID); err != nil {
+			return fmt.Errorf("failed to seed active_category_accounts on create: %w", err)
+		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 // GetByID retrieves an account by ID.
@@ -302,7 +310,10 @@ func (r *AccountRepository) GetActiveForCategory(ctx context.Context, category d
 	if errors.Is(err, domain.ErrAccountNotFound) {
 		globalActive, gErr := r.GetActive(ctx)
 		if gErr == nil && globalActive != nil {
-			_ = r.SetActiveForCategory(ctx, category, globalActive.ID)
+			_, _ = r.db.ExecContext(ctx, `
+				INSERT OR IGNORE INTO active_category_accounts (category, account_id)
+				VALUES (?, ?)
+			`, catStr, globalActive.ID)
 			return globalActive, nil
 		}
 		return nil, domain.ErrNoActiveAccount

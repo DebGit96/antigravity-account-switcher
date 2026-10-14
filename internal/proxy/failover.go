@@ -480,6 +480,10 @@ func (f *FailoverEngine) isPrimaryModelLocked(model string) bool {
 	if strings.EqualFold(norm, f.normPrimary) {
 		return true
 	}
+	cat := CategorizeModel(norm)
+	if f.primaryCat != CategoryUnknown && cat != CategoryUnknown && cat != f.primaryCat {
+		return false
+	}
 	lowerNorm := strings.ToLower(norm)
 	if f.primaryHasFlash && strings.Contains(lowerNorm, "flash") && !strings.Contains(lowerNorm, "pro") {
 		return true
@@ -488,7 +492,6 @@ func (f *FailoverEngine) isPrimaryModelLocked(model string) bool {
 		return true
 	}
 
-	cat := CategorizeModel(norm)
 	return cat != CategoryUnknown && cat == f.primaryCat && cat != f.secondaryCat
 }
 
@@ -500,6 +503,10 @@ func (f *FailoverEngine) isSecondaryModelLocked(model string) bool {
 	if strings.EqualFold(norm, f.normSecondary) {
 		return true
 	}
+	cat := CategorizeModel(norm)
+	if f.secondaryCat != CategoryUnknown && cat != CategoryUnknown && cat != f.secondaryCat {
+		return false
+	}
 	lowerNorm := strings.ToLower(norm)
 	if f.secondaryHasFlash && strings.Contains(lowerNorm, "flash") && !strings.Contains(lowerNorm, "pro") {
 		return true
@@ -508,7 +515,6 @@ func (f *FailoverEngine) isSecondaryModelLocked(model string) bool {
 		return true
 	}
 
-	cat := CategorizeModel(norm)
 	return cat != CategoryUnknown && cat == f.secondaryCat && cat != f.primaryCat
 }
 
@@ -689,10 +695,11 @@ func (f *FailoverEngine) PredictiveCheck(
 
 	// Fast check if matches primary
 	lowerNormReq := strings.ToLower(normReq)
+	catReqMatches := priCat == CategoryUnknown || catReq == CategoryUnknown || catReq == priCat
 	matchesPrimary := strings.EqualFold(normReq, normPri) ||
-		(priCat != CategoryUnknown && priCat != secCat && catReq == priCat) ||
-		(priHasPro && strings.Contains(lowerNormReq, "pro") && !strings.Contains(lowerNormReq, "flash")) ||
-		(priHasFlash && strings.Contains(lowerNormReq, "flash") && !strings.Contains(lowerNormReq, "pro"))
+		(catReqMatches && priCat != CategoryUnknown && priCat != secCat && catReq == priCat) ||
+		(catReqMatches && priHasPro && strings.Contains(lowerNormReq, "pro") && !strings.Contains(lowerNormReq, "flash")) ||
+		(catReqMatches && priHasFlash && strings.Contains(lowerNormReq, "flash") && !strings.Contains(lowerNormReq, "pro"))
 
 	if !matchesPrimary {
 		f.mu.RUnlock()
@@ -926,18 +933,30 @@ func (f *FailoverEngine) HandleExhaustion(
 		return ActionRotateAccount, primary, next, nil
 	}
 
-	// 3. Fallback is enabled: retrieve or initialize account state
+	// 3. Fallback is enabled: check if model belongs to fallback tier
+	isPrimary := f.isPrimaryModelLocked(failedModel)
+	isSecondary := f.isSecondaryModelLocked(failedModel)
+
+	// If failed model is neither primary nor secondary, it is outside the fallback tier:
+	// rotate immediately for this category without mutating primary/secondary fallback state.
+	if !isPrimary && !isSecondary {
+		next, rotErr := f.rotateAccountForCategoryLocked(ctx, acc, failedCat, &eventsToEmit)
+		if rotErr != nil {
+			return ActionRotateAccount, primary, nil, rotErr
+		}
+		return ActionRotateAccount, primary, next, nil
+	}
+
 	state, exists := f.accountStates[acc.ID]
 	if !exists {
 		state = &accountFallbackState{}
 		f.accountStates[acc.ID] = state
 	}
 
-	isSecondary := f.isSecondaryModelLocked(failedModel)
 	hasSecondaryQuota := f.hasSecondaryQuotaLocked(ctx, acc, state)
 
 	// 4. If failedModel was primary and secondary has available quota: intra-account fallback!
-	if !isSecondary && hasSecondaryQuota {
+	if isPrimary && hasSecondaryQuota {
 		wasPrimaryExhausted := state.primaryExhausted
 		state.primaryExhausted = true
 		state.lastFallback = time.Now().UTC()
