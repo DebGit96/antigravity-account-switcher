@@ -89,6 +89,12 @@ CREATE TABLE IF NOT EXISTS proxy_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_proxy_events_created_at ON proxy_events(created_at);
+
+-- 6. Model category active accounts table
+CREATE TABLE IF NOT EXISTS active_category_accounts (
+    category TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
+);
 `,
 	},
 }
@@ -97,15 +103,19 @@ CREATE INDEX IF NOT EXISTS idx_proxy_events_created_at ON proxy_events(created_a
 func Migrate(db *DB) error {
 	ctx := context.Background()
 
-	// Ensure schema_migrations exists first
+	// Ensure schema_migrations and active_category_accounts exist first
 	initSQL := `
 	CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY,
 		description TEXT NOT NULL,
 		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS active_category_accounts (
+		category TEXT PRIMARY KEY,
+		account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
 	);`
 	if _, err := db.ExecContext(ctx, initSQL); err != nil {
-		return fmt.Errorf("failed to create schema_migrations table: %w", err)
+		return fmt.Errorf("failed to create schema_migrations/active_category_accounts table: %w", err)
 	}
 
 	for _, m := range Migrations {
@@ -137,6 +147,16 @@ func Migrate(db *DB) error {
 			_ = tx.Rollback()
 			return fmt.Errorf("failed to commit migration %d: %w", m.Version, err)
 		}
+	}
+
+	// Seed active_category_accounts if empty and an active account exists
+	seedSQL := `
+	INSERT OR IGNORE INTO active_category_accounts (category, account_id)
+	SELECT 'claude_gpt', id FROM accounts WHERE is_active = 1
+	UNION ALL
+	SELECT 'gemini', id FROM accounts WHERE is_active = 1;`
+	if _, err := db.ExecContext(ctx, seedSQL); err != nil {
+		return fmt.Errorf("failed to seed active_category_accounts: %w", err)
 	}
 
 	return nil
