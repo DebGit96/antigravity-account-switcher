@@ -17,6 +17,22 @@ type AccountRepository struct {
 	db *DB
 }
 
+// bucketCategoryPredicate matches quota_buckets rows (alias qb) belonging to a
+// model category: Claude/GPT third-party buckets for "claude_gpt", and Gemini
+// buckets for "gemini". Two placeholders are bound to the category string.
+const bucketCategoryPredicate = `
+	AND (
+		(? = 'claude_gpt' AND (
+			LOWER(qb.bucket_id) LIKE '%claude%' OR LOWER(qb.bucket_id) LIKE '%gpt%' OR LOWER(qb.bucket_id) LIKE '%3p%' OR
+			LOWER(qb.display_name) LIKE '%claude%' OR LOWER(qb.display_name) LIKE '%gpt%' OR LOWER(qb.display_name) LIKE '%3p%'
+		))
+		OR
+		(? = 'gemini' AND (
+			LOWER(qb.bucket_id) LIKE '%gemini%' OR LOWER(qb.display_name) LIKE '%gemini%'
+		))
+	)
+`
+
 // NewAccountRepository creates a new SQLite AccountRepository.
 func NewAccountRepository(db *DB) *AccountRepository {
 	return &AccountRepository{db: db}
@@ -288,6 +304,10 @@ func (r *AccountRepository) GetNextAvailable(ctx context.Context, excludeID stri
 }
 
 // GetActiveForCategory retrieves the active account designated for a specific model category.
+// If the pinned account's bucket for that category is exhausted (and not yet past
+// its reset time), the pin is advanced to the next eligible account so traffic
+// does not keep hitting a known-dead account; when no candidate exists the dead
+// pin is returned unchanged, preserving pre-fix behavior.
 func (r *AccountRepository) GetActiveForCategory(ctx context.Context, category domain.ModelCategory) (*domain.Account, error) {
 	catStr := category.String()
 	if catStr == "unknown" || catStr == "" {
@@ -304,7 +324,18 @@ func (r *AccountRepository) GetActiveForCategory(ctx context.Context, category d
 	row := r.db.QueryRowContext(ctx, query, catStr)
 	acc, err := r.scanAccount(row)
 	if err == nil {
-		return acc, nil
+		dead, dErr := r.hasExhaustedBucketForCategory(ctx, acc.ID, catStr)
+		if dErr != nil || !dead {
+			return acc, nil
+		}
+		next, nErr := r.GetNextAvailableForCategory(ctx, category, acc.ID)
+		if nErr != nil || next == nil {
+			return acc, nil
+		}
+		if sErr := r.SetActiveForCategory(ctx, category, next.ID); sErr != nil {
+			return acc, nil
+		}
+		return next, nil
 	}
 
 	if errors.Is(err, domain.ErrAccountNotFound) {
@@ -320,6 +351,23 @@ func (r *AccountRepository) GetActiveForCategory(ctx context.Context, category d
 	}
 
 	return nil, err
+}
+
+// hasExhaustedBucketForCategory reports whether the account has an exhausted
+// quota bucket for the given category whose reset time is still in the future.
+func (r *AccountRepository) hasExhaustedBucketForCategory(ctx context.Context, accountID, catStr string) (bool, error) {
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	query := `
+		SELECT COUNT(1) FROM quota_buckets qb
+		WHERE qb.account_id = ?
+		  AND qb.remaining_fraction <= 0.0
+		  AND qb.reset_time > ?
+	` + bucketCategoryPredicate
+	var count int
+	if err := r.db.QueryRowContext(ctx, query, accountID, nowStr, catStr, catStr).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // SetActiveForCategory sets the active account pointer for a specific model category.
@@ -374,6 +422,15 @@ func (r *AccountRepository) SetActiveForCategory(ctx context.Context, category d
 
 // GetNextAvailableForCategory selects the next eligible account for a model category,
 // excluding the specified account ID and accounts whose quota for that category is exhausted.
+//
+// Eligibility rules:
+//   - 'active' accounts are eligible unless a recorded bucket for the category
+//     is exhausted and not yet past reset.
+//   - 'exhausted' accounts are eligible only when quota rows positively show a
+//     healthy bucket for this category: a 429 in one category must not lock the
+//     account out of the other, but a bare 'exhausted' status without fresh
+//     quota evidence keeps the account excluded.
+//   - 'error' and 'disabled' accounts are never eligible.
 func (r *AccountRepository) GetNextAvailableForCategory(ctx context.Context, category domain.ModelCategory, excludeID string) (*domain.Account, error) {
 	catStr := category.String()
 	if catStr == "unknown" || catStr == "" {
@@ -384,28 +441,30 @@ func (r *AccountRepository) GetNextAvailableForCategory(ctx context.Context, cat
 	query := `
 		SELECT a.id, a.email, a.refresh_token, a.access_token, a.token_expiry, a.is_active, a.status, a.created_at, a.updated_at
 		FROM accounts a
-		WHERE a.status = 'active'
-		  AND (? = '' OR a.id != ?)
+		WHERE (? = '' OR a.id != ?)
+		  AND (
+			a.status = 'active'
+			OR (
+				a.status = 'exhausted'
+				AND EXISTS (
+					SELECT 1 FROM quota_buckets qb
+					WHERE qb.account_id = a.id
+					  AND qb.remaining_fraction > 0.0
+	` + bucketCategoryPredicate + `
+				)
+			)
+		  )
 		  AND NOT EXISTS (
 			  SELECT 1 FROM quota_buckets qb
 			  WHERE qb.account_id = a.id
 			    AND qb.remaining_fraction <= 0.0
 			    AND qb.reset_time > ?
-			    AND (
-				    (? = 'claude_gpt' AND (
-					    LOWER(qb.bucket_id) LIKE '%claude%' OR LOWER(qb.bucket_id) LIKE '%gpt%' OR LOWER(qb.bucket_id) LIKE '%3p%' OR
-					    LOWER(qb.display_name) LIKE '%claude%' OR LOWER(qb.display_name) LIKE '%gpt%' OR LOWER(qb.display_name) LIKE '%3p%'
-				    ))
-				    OR
-				    (? = 'gemini' AND (
-					    LOWER(qb.bucket_id) LIKE '%gemini%' OR LOWER(qb.display_name) LIKE '%gemini%'
-				    ))
-			    )
+	` + bucketCategoryPredicate + `
 		  )
 		ORDER BY a.updated_at ASC
 		LIMIT 1
 	`
-	row := r.db.QueryRowContext(ctx, query, excludeID, excludeID, nowStr, catStr, catStr)
+	row := r.db.QueryRowContext(ctx, query, excludeID, excludeID, catStr, catStr, nowStr, catStr, catStr)
 	acc, err := r.scanAccount(row)
 	if errors.Is(err, domain.ErrAccountNotFound) {
 		return nil, domain.ErrNoAvailableAccount
