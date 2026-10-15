@@ -1063,14 +1063,6 @@ func (f *FailoverEngine) RotateAccountForCategory(ctx context.Context, exhausted
 	return f.rotateAccountForCategoryLocked(ctx, exhaustedAcc, category, &eventsToEmit)
 }
 
-func (f *FailoverEngine) rotateAccountLocked(
-	ctx context.Context,
-	exhaustedAcc *domain.Account,
-	eventsToEmit *[]*domain.ProxyEvent,
-) (*domain.Account, error) {
-	return f.rotateAccountForCategoryLocked(ctx, exhaustedAcc, CategoryUnknown, eventsToEmit)
-}
-
 func (f *FailoverEngine) rotateAccountForCategoryLocked(
 	ctx context.Context,
 	exhaustedAcc *domain.Account,
