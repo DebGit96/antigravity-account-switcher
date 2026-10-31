@@ -849,6 +849,7 @@ func runLaunch(args []string) {
 	}
 	if cfg == nil {
 		cfg = config.DefaultConfig()
+		cfg.DBPath = config.DefaultDBPath()
 	}
 
 	defaultPollInterval := quota.DefaultPollInterval
