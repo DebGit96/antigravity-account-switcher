@@ -183,6 +183,10 @@ type ProxyHandler struct {
 	failoverEngine   *FailoverEngine
 	tokenRefresher   TokenRefresher
 	client           *http.Client
+
+	// extractModel pulls the requested model out of a request. It is a field
+	// so tests can count how often the request is scanned.
+	extractModel func(r *http.Request, body []byte) (string, ModelCategory, ModelSource)
 }
 
 // NewProxyHandler creates an initialized ProxyHandler.
@@ -243,6 +247,7 @@ func NewProxyHandler(accountRepo domain.AccountRepository, opts ...Option) (*Pro
 		failoverEngine:   failoverEngine,
 		tokenRefresher:   cfg.TokenRefresher,
 		client:           client,
+		extractModel:     ExtractModelFromRequest,
 	}, nil
 }
 
@@ -418,18 +423,23 @@ func (h *ProxyHandler) rewriteRequestModel(
 
 // applyPredictiveFallback checks whether the incoming request targets an exhausted primary
 // model on the active account, and if so, proactively rewrites it to the secondary model.
+// reqModel is the model already extracted from r and buffered; pass "" if the request
+// was not scanned yet and it will be extracted here.
 // Returns the updated BufferedRequest, the effective model name, and whether rewrite occurred.
 func (h *ProxyHandler) applyPredictiveFallback(
 	ctx context.Context,
 	acc *domain.Account,
 	r *http.Request,
 	buffered *BufferedRequest,
+	reqModel string,
 ) (*BufferedRequest, string, bool) {
 	if h.failoverEngine == nil || acc == nil || r == nil || buffered == nil {
 		return buffered, "", false
 	}
 
-	reqModel, _, _ := ExtractModelFromRequest(r, buffered.Bytes())
+	if reqModel == "" {
+		reqModel, _, _ = h.extractModel(r, buffered.Bytes())
+	}
 	if reqModel == "" {
 		return buffered, "", false
 	}
@@ -519,7 +529,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isCloudCode := !isExplicitForwardToOther
 
 	// 2. Capture original request baseline and model category
-	origModel, origCategory, _ := ExtractModelFromRequest(r, buffered.Bytes())
+	origModel, origCategory, _ := h.extractModel(r, buffered.Bytes())
 	if origCategory == CategoryUnknown && origModel != "" {
 		origCategory = CategorizeModel(origModel)
 	}
@@ -583,7 +593,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Predictive fallback check before initial upstream dispatch
 	if isCloudCode && !isPassThrough && currentAcc != nil && origModel != "" {
-		newBuffered, targetModel, rewritten := h.applyPredictiveFallback(ctx, currentAcc, r, buffered)
+		newBuffered, targetModel, rewritten := h.applyPredictiveFallback(ctx, currentAcc, r, buffered, origModel)
 		if rewritten {
 			buffered = newBuffered
 			currentModel = targetModel
